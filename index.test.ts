@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import type { Api, Model, RefreshModelsContext } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, ModelsRefreshOptions, RefreshModelsContext } from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ProviderConfig,
+} from "@earendil-works/pi-coding-agent";
 import registerZenmuxProvider, {
 	MODELS_DEV_URL,
 	ZENMUX_ANTHROPIC_BASE_URL,
@@ -10,6 +18,8 @@ import registerZenmuxProvider, {
 	ZENMUX_OPENAI_BASE_URL,
 	ZENMUX_PROVIDER_ID,
 	fetchZenmuxProviderModels,
+	getZenmuxModelsCachePath,
+	loadZenmuxModelsCache,
 	refreshZenmuxModels,
 	restoreModels,
 	routingFor,
@@ -130,6 +140,24 @@ function makeStoredModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
 	};
 }
 
+function useTempAgentDir(): () => void {
+	const directory = mkdtempSync(join(tmpdir(), "pi-zenmux-"));
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = directory;
+	return () => {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(directory, { recursive: true, force: true });
+	};
+}
+
+function writeModelsCache(models: Model<Api>[]): void {
+	writeFileSync(
+		getZenmuxModelsCachePath(),
+		`${JSON.stringify({ schema: "pi-zenmux/2", checkedAt: Date.now(), models }, null, 2)}\n`,
+	);
+}
+
 function makeRefreshContext(overrides: Partial<RefreshModelsContext> = {}) {
 	const published: { persist?: unknown; update?: () => void }[] = [];
 	const context = {
@@ -224,116 +252,182 @@ test("restoreModels re-derives routing for snapshots written by an older version
 	assert.equal(restored[1]?.baseUrl, ZENMUX_ANTHROPIC_BASE_URL);
 });
 
-test("registerZenmuxProvider registers the live catalog and refreshes it through pi", async () => {
-	const restoreFetch = stubCatalogFetch();
+function makeExtensionHarness() {
 	let providerName = "";
 	let providerConfig: ProviderConfig | undefined;
+	const refreshCalls: ModelsRefreshOptions[] = [];
+	const notifications: { message: string; type?: string }[] = [];
+	const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+	const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => unknown>();
+	const ctx = {
+		modelRegistry: {
+			refresh: async (options: ModelsRefreshOptions) => {
+				refreshCalls.push(options);
+				return { aborted: false, errors: new Map() };
+			},
+		},
+		ui: {
+			notify(message: string, type?: string) {
+				notifications.push({ message, type });
+			},
+		},
+	} as unknown as ExtensionCommandContext;
 	const pi = {
 		registerProvider(name: string, config: ProviderConfig) {
 			providerName = name;
 			providerConfig = config;
 		},
+		on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+			events.set(name, handler);
+		},
+		registerCommand(name: string, options: { handler: (args: string, ctx: ExtensionCommandContext) => unknown }) {
+			commands.set(name, options.handler);
+		},
 	} as unknown as ExtensionAPI;
+	return {
+		pi,
+		ctx,
+		refreshCalls,
+		notifications,
+		events,
+		commands,
+		get providerName() {
+			return providerName;
+		},
+		get providerConfig() {
+			return providerConfig;
+		},
+	};
+}
+
+test("registerZenmuxProvider fetches only when the cache is missing and writes its own JSON file", async () => {
+	const restoreAgentDir = useTempAgentDir();
+	const restoreFetch = stubCatalogFetch();
+	const harness = makeExtensionHarness();
 
 	try {
-		await registerZenmuxProvider(pi);
+		await registerZenmuxProvider(harness.pi);
 
-		assert.equal(providerName, ZENMUX_PROVIDER_ID);
-		assert.equal(providerConfig?.apiKey, "$ZENMUX_API_KEY");
-		assert.equal(providerConfig?.baseUrl, ZENMUX_OPENAI_BASE_URL);
-		assert.equal(providerConfig?.api, "openai-completions");
-		assert.equal(providerConfig?.models?.length, 3);
+		assert.equal(harness.providerName, ZENMUX_PROVIDER_ID);
+		assert.equal(harness.providerConfig?.apiKey, "$ZENMUX_API_KEY");
+		assert.equal(harness.providerConfig?.baseUrl, ZENMUX_OPENAI_BASE_URL);
+		assert.equal(harness.providerConfig?.api, "openai-completions");
+		assert.equal(harness.providerConfig?.models?.length, 3);
 		assert.deepEqual(
-			providerConfig?.models?.map((model) => model.api),
+			harness.providerConfig?.models?.map((model) => model.api),
 			["anthropic-messages", "openai-completions", "openai-completions"],
 		);
-		assert.equal(typeof providerConfig?.refreshModels, "function");
+		assert.equal(typeof harness.providerConfig?.refreshModels, "function");
+
+		const cache = JSON.parse(readFileSync(getZenmuxModelsCachePath(), "utf8")) as {
+			schema: string;
+			checkedAt: number;
+			models: Model<Api>[];
+		};
+		assert.equal(cache.schema, "pi-zenmux/2");
+		assert.ok(cache.checkedAt > 0);
+		assert.equal(cache.models.length, 3);
+		assert.ok(cache.models.every((model) => model.provider === ZENMUX_PROVIDER_ID));
+		assert.equal(loadZenmuxModelsCache()?.length, 3);
+
+		// pi's cache-only refresh never performs network I/O or rewrites the file.
+		const offline = makeRefreshContext();
+		assert.equal((await refreshZenmuxModels(offline.context)).length, 3);
+		assert.equal(offline.published.length, 0);
 	} finally {
 		restoreFetch();
+		restoreAgentDir();
 	}
-
-	// Offline startup: the factory catalog is served and persisted for offline runs.
-	const offline = makeRefreshContext();
-	const offlineModels = await refreshZenmuxModels(offline.context);
-	assert.equal(offlineModels.length, 3);
-	assert.equal(offline.published.length, 1);
-	const persisted = offline.published[0]?.persist as { models: Model<Api>[]; checkedAt: number; etag: string };
-	assert.equal(persisted.models.length, offlineModels.length);
-	assert.ok(persisted.models.every((model) => model.provider === ZENMUX_PROVIDER_ID));
-	assert.equal(persisted.etag, "pi-zenmux/2");
-	assert.ok(persisted.checkedAt > 0);
-
-	// A fresh write is skipped while the snapshot is current.
-	const repeated = makeRefreshContext({
-		stored: {
-			models: offlineModels as unknown as Model<Api>[],
-			checkedAt: Date.now(),
-			etag: "pi-zenmux/2",
-		},
-	});
-	assert.equal((await refreshZenmuxModels(repeated.context)).length, 3);
-	assert.equal(repeated.published.length, 0);
 });
 
-test("refreshZenmuxModels restores the snapshot when discovery is unavailable", async () => {
+test("registerZenmuxProvider loads an existing cache without any startup fetch", async () => {
+	const restoreAgentDir = useTempAgentDir();
+	writeModelsCache([makeStoredModel()]);
+	let fetchCalls = 0;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async () => {
+		fetchCalls++;
+		throw new Error("startup must not use the network");
+	}) as typeof fetch;
+	const harness = makeExtensionHarness();
+
+	try {
+		await registerZenmuxProvider(harness.pi);
+		assert.equal(fetchCalls, 0);
+		assert.equal(harness.providerConfig?.models?.length, 1);
+		assert.equal(harness.providerConfig?.models?.[0]?.api, "openai-completions");
+		assert.equal(harness.providerConfig?.models?.[0]?.baseUrl, ZENMUX_OPENAI_BASE_URL);
+	} finally {
+		globalThis.fetch = originalFetch;
+		restoreAgentDir();
+	}
+});
+
+test("registerZenmuxProvider still registers when first-time discovery fails", async () => {
+	const restoreAgentDir = useTempAgentDir();
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = (async () => {
 		throw new Error("offline");
 	}) as typeof fetch;
+	const harness = makeExtensionHarness();
 
 	try {
-		await new Promise<void>((resolve) => {
-			const pi = {
-				registerProvider() {
-					resolve();
-				},
-			} as unknown as ExtensionAPI;
-			void registerZenmuxProvider(pi);
-		});
-
-		const { context, published } = makeRefreshContext({
-			stored: { models: [makeStoredModel()], checkedAt: Date.now(), etag: "pi-zenmux/2" },
-		});
-		const models = await refreshZenmuxModels(context);
-		assert.equal(models.length, 1);
-		assert.equal(models[0]?.api, "openai-completions");
-		assert.equal(published.length, 0);
-
-		// A snapshot from another scheme is ignored instead of yielding retired api ids.
-		const foreign = makeRefreshContext({
-			stored: { models: [makeStoredModel()], checkedAt: Date.now(), etag: undefined },
-		});
-		assert.deepEqual(await refreshZenmuxModels(foreign.context), []);
+		await registerZenmuxProvider(harness.pi);
+		assert.equal(harness.providerName, ZENMUX_PROVIDER_ID);
+		assert.deepEqual(harness.providerConfig?.models, []);
 	} finally {
 		globalThis.fetch = originalFetch;
+		restoreAgentDir();
 	}
 });
 
-test("refreshZenmuxModels keeps the snapshot when a network refresh fails", async () => {
+test("refreshZenmuxModels reports failures and preserves the last good cache", async () => {
+	const restoreAgentDir = useTempAgentDir();
+	writeModelsCache([makeStoredModel()]);
+	const harness = makeExtensionHarness();
+	await registerZenmuxProvider(harness.pi);
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = (async () => {
 		throw new Error("network down");
 	}) as typeof fetch;
 
 	try {
-		await new Promise<void>((resolve) => {
-			const pi = {
-				registerProvider() {
-					resolve();
-				},
-			} as unknown as ExtensionAPI;
-			void registerZenmuxProvider(pi);
-		});
-
-		const { context, published } = makeRefreshContext({
-			allowNetwork: true,
-			stored: { models: [makeStoredModel()], checkedAt: Date.now(), etag: "pi-zenmux/2" },
-		});
-		const models = await refreshZenmuxModels(context);
-		assert.equal(models.length, 1);
-		assert.equal(published.length, 0);
+		const { context } = makeRefreshContext({ allowNetwork: true });
+		await assert.rejects(refreshZenmuxModels(context), /network down/);
+		assert.equal(loadZenmuxModelsCache()?.length, 1);
+		assert.equal(harness.providerConfig?.models?.length, 1);
 	} finally {
 		globalThis.fetch = originalFetch;
+		restoreAgentDir();
+	}
+});
+
+test("session_start schedules one background refresh and /zenmux-refresh forces another", async () => {
+	const restoreAgentDir = useTempAgentDir();
+	writeModelsCache([makeStoredModel()]);
+	const harness = makeExtensionHarness();
+
+	try {
+		await registerZenmuxProvider(harness.pi);
+		const sessionStart = harness.events.get("session_start");
+		assert.ok(sessionStart);
+		sessionStart({ type: "session_start" }, harness.ctx);
+		sessionStart({ type: "session_start" }, harness.ctx);
+		assert.equal(harness.refreshCalls.length, 1);
+		// Let the background task settle before checking a separate manual refresh.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const command = harness.commands.get("zenmux-refresh");
+		assert.ok(command);
+		await command("", harness.ctx);
+		assert.equal(harness.refreshCalls.length, 2);
+		for (const options of harness.refreshCalls) {
+			assert.deepEqual(options.providers, [ZENMUX_PROVIDER_ID]);
+			assert.equal(options.force, true);
+		}
+		assert.match(harness.notifications.at(-1)?.message ?? "", /refreshed \(1 models\)/);
+	} finally {
+		restoreAgentDir();
 	}
 });
 

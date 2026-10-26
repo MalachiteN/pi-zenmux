@@ -1,5 +1,9 @@
+import { readFileSync } from "node:fs";
+import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { Api, Model, ModelCost, ModelCostTier, ModelPromptCache, RefreshModelsContext } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 /**
  * ZenMux provider extension.
@@ -15,15 +19,24 @@ const DEFAULT_MAX_TOKENS = 32_768;
 /** ZenMux documents a 5 minute default prompt-cache TTL and an optional 1 hour TTL. */
 const CACHE_SHORT_TTL_SECONDS = 5 * 60;
 const CACHE_LONG_TTL_SECONDS = 60 * 60;
-/** Throttle persisted catalog writes the same way pi's own remote catalog does. */
-const SNAPSHOT_WRITE_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 8_000;
 /**
- * Marker kept in the snapshot's opaque `etag` slot. A snapshot written by an
- * older plugin version can carry a retired `api` id, so only snapshots written
- * by this scheme are restored.
+ * Cache schema marker. A snapshot written by an older plugin version can carry
+ * a retired `api` id, so only snapshots written by this scheme are restored.
  */
 const SNAPSHOT_TAG = "pi-zenmux/2";
+export const ZENMUX_MODELS_CACHE_FILENAME = "zenmux-models.json";
+
+export function getZenmuxModelsCachePath(): string {
+	const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+	return join(agentDir, ZENMUX_MODELS_CACHE_FILENAME);
+}
+
+type ZenmuxModelsCache = {
+	schema: string;
+	checkedAt: number;
+	models: Model<Api>[];
+};
 
 export const ZENMUX_BASE_URL = (process.env.ZENMUX_BASE_URL || "https://zenmux.ai").replace(/\/$/, "");
 export const ZENMUX_OPENAI_BASE_URL = `${ZENMUX_BASE_URL}/api/v1`;
@@ -371,62 +384,125 @@ export function restoreModels(storedModels: readonly Model<Api>[]): ZenmuxModel[
 	});
 }
 
-/** Snapshots written by an older scheme can carry a retired `api` id, so they are ignored. */
-function restoreSnapshot(stored: RefreshModelsContext["stored"]): ZenmuxModel[] {
-	if (stored?.etag !== SNAPSHOT_TAG || !Array.isArray(stored.models) || stored.models.length === 0) return [];
-	return restoreModels(stored.models);
+/** Load only the extension-owned cache; pi's global model store is not required. */
+export function loadZenmuxModelsCache(path = getZenmuxModelsCachePath()): ZenmuxModel[] | undefined {
+	try {
+		const cache = JSON.parse(readFileSync(path, "utf8")) as Partial<ZenmuxModelsCache>;
+		if (cache.schema !== SNAPSHOT_TAG || !Array.isArray(cache.models) || cache.models.length === 0) {
+			return undefined;
+		}
+		return restoreModels(cache.models);
+	} catch {
+		// A missing, unreadable, or incomplete cache is rebuilt from the network.
+		return undefined;
+	}
 }
 
-/** The snapshot is rewritten when the catalog changed, and otherwise at most every few hours. */
-function shouldPersist(
-	storedModels: readonly ZenmuxModel[],
-	checkedAt: number | undefined,
-	models: readonly ZenmuxModel[],
-): boolean {
-	if (storedModels.length !== models.length) return true;
-	if (storedModels.some((model, index) => model.id !== models[index]?.id)) return true;
-	return Date.now() - (checkedAt ?? 0) > SNAPSHOT_WRITE_INTERVAL_MS;
+let cacheWriteCounter = 0;
+
+async function saveZenmuxModelsCache(models: readonly ZenmuxModel[], path = getZenmuxModelsCachePath()): Promise<void> {
+	const cache: ZenmuxModelsCache = {
+		schema: SNAPSHOT_TAG,
+		checkedAt: Date.now(),
+		models: models.map((model): Model<Api> => ({ ...model, provider: ZENMUX_PROVIDER_ID })),
+	};
+	const temporaryPath = `${path}.${process.pid}.${cacheWriteCounter++}.tmp`;
+	await mkdir(dirname(path), { recursive: true });
+	try {
+		await writeFile(temporaryPath, `${JSON.stringify(cache, null, 2)}\n`, "utf8");
+		await rename(temporaryPath, path);
+	} finally {
+		// After rename the temporary path no longer exists; ignore cleanup races.
+		await unlink(temporaryPath).catch(() => undefined);
+	}
 }
 
-/** Models fetched by the extension factory; they take precedence over the persisted snapshot. */
-let discoveredModels: ZenmuxModel[] | undefined;
+/** Current in-memory catalog, initialized synchronously from the extension-owned cache when present. */
+let discoveredModels: ZenmuxModel[] = [];
+
+async function fetchAndCacheZenmuxModels(signal?: AbortSignal): Promise<ZenmuxModel[]> {
+	const models = await fetchZenmuxProviderModels({ signal });
+	if (signal?.aborted) return discoveredModels;
+	await saveZenmuxModelsCache(models);
+	discoveredModels = models;
+	return models;
+}
 
 export async function refreshZenmuxModels(context: RefreshModelsContext): Promise<ZenmuxModel[]> {
-	const stored = restoreSnapshot(context.stored);
-
-	let fresh = discoveredModels;
-	if ((!fresh || context.force) && context.allowNetwork && !context.signal.aborted) {
-		try {
-			fresh = await fetchZenmuxProviderModels({ signal: context.signal });
-		} catch {
-			// Keep whatever catalog we already have when discovery fails.
-			return fresh ?? stored;
-		}
-		if (context.signal.aborted) return fresh ?? stored;
-	}
-	if (!fresh) return stored;
-
-	if (shouldPersist(stored, context.stored?.checkedAt, fresh)) {
-		await context.publish({
-			persist: {
-				models: fresh.map((model): Model<Api> => ({ ...model, provider: ZENMUX_PROVIDER_ID })),
-				checkedAt: Date.now(),
-				etag: SNAPSHOT_TAG,
-			},
-		});
-	}
-	return fresh;
+	if (!context.allowNetwork || context.signal.aborted) return discoveredModels;
+	// On failure, let pi retain the currently registered list and surface the error
+	// to a manual refresh; background refresh deliberately ignores that error.
+	return fetchAndCacheZenmuxModels(context.signal);
 }
 
 export default async function registerZenmuxProvider(pi: ExtensionAPI): Promise<void> {
-	discoveredModels = await fetchZenmuxProviderModels().catch(() => undefined);
+	const cachedModels = loadZenmuxModelsCache();
+	discoveredModels = cachedModels ?? [];
+	let shouldRefreshAfterStartup = cachedModels !== undefined;
+
+	// Network access is only needed for first-time initialization. Once a cache
+	// exists, extension loading never waits for ZenMux or models.dev.
+	if (!cachedModels) {
+		try {
+			discoveredModels = await fetchAndCacheZenmuxModels();
+		} catch {
+			// Register an empty provider rather than preventing pi from starting.
+			// session_start retries the initial discovery in the background.
+			shouldRefreshAfterStartup = true;
+		}
+	}
 
 	pi.registerProvider(ZENMUX_PROVIDER_ID, {
 		name: "ZenMux",
 		baseUrl: ZENMUX_OPENAI_BASE_URL,
 		apiKey: "$ZENMUX_API_KEY",
 		api: ZENMUX_OPENAI_API,
-		models: discoveredModels ?? [],
+		models: discoveredModels,
 		refreshModels: refreshZenmuxModels,
+	});
+
+	let sessionAbort: AbortController | undefined;
+	let refreshTask: Promise<void> | undefined;
+	const refresh = (ctx: ExtensionContext, signal?: AbortSignal): Promise<void> => {
+		if (refreshTask) return refreshTask;
+		refreshTask = (async () => {
+			const result = await ctx.modelRegistry.refresh({
+				providers: [ZENMUX_PROVIDER_ID],
+				force: true,
+				signal,
+			});
+			const error = result.errors.get(ZENMUX_PROVIDER_ID);
+			if (error) throw error;
+		})().finally(() => {
+			refreshTask = undefined;
+		});
+		return refreshTask;
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		sessionAbort = new AbortController();
+		if (!shouldRefreshAfterStartup) return;
+		// One background check per extension runtime; later startups load the new cache.
+		shouldRefreshAfterStartup = false;
+		void refresh(ctx, sessionAbort.signal).catch(() => {
+			// Cached models remain usable offline. /zenmux-refresh reports failures explicitly.
+		});
+	});
+	pi.on("session_shutdown", () => {
+		sessionAbort?.abort();
+	});
+
+	pi.registerCommand("zenmux-refresh", {
+		description: "Refresh the ZenMux model catalog now",
+		handler: async (_args, ctx: ExtensionCommandContext) => {
+			ctx.ui.notify("Refreshing the ZenMux model catalog…", "info");
+			try {
+				await refresh(ctx);
+				ctx.ui.notify(`ZenMux model catalog refreshed (${discoveredModels.length} models).`, "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`ZenMux model refresh failed: ${message}`, "error");
+			}
+		},
 	});
 }

@@ -7,8 +7,9 @@ ZenMux speaks both the OpenAI Chat Completions and the Anthropic Messages protoc
 ## Features
 
 - Registers provider `zenmux`, API key env var `ZENMUX_API_KEY`
-- Discovers the live catalog from `https://zenmux.ai/api/v1/models` at startup and through pi's `refreshModels`
-- Keeps the last good catalog as a snapshot, so offline startups still list models
+- Discovers the live catalog from `https://zenmux.ai/api/v1/models` only when its local cache is missing; existing caches make startup independent of the network
+- Stores the catalog in `~/.pi/agent/zenmux-models.json` and checks for updates in a background task after the session starts
+- Supports `/zenmux-refresh` for an immediate forced update; failed updates preserve the last good catalog
 - Routes `anthropic/*` models to `https://zenmux.ai/api/anthropic` (`anthropic-messages`) and every other model to `https://zenmux.ai/api/v1` (`openai-completions`)
 - Registers chat models only: image, video, speech, transcription, embedding, and rerank models from the same catalog are skipped
 - Maps tiered ZenMux pricing to pi's request-wide cost tiers, cache prices (5 minute, generic, 1 hour) to `cost.cacheWrite`, and prompt-cache TTLs to `promptCache` so pi can warm caches
@@ -49,6 +50,14 @@ pi --list-models zenmux
 ```
 
 You can also start `pi` normally and switch with `/model`.
+
+## Model catalog cache
+
+The extension owns a separate cache at `~/.pi/agent/zenmux-models.json` (or `$PI_CODING_AGENT_DIR/zenmux-models.json`). Startup reads this file directly and never waits for a network refresh when it exists. A background refresh runs after `session_start`, so the registered catalog can become stale between checks but remains available offline.
+
+On the first run, when the cache does not exist, the extension fetches the catalog before registering models. Discovery has an 8-second timeout and a failure does not prevent pi from starting; the provider is registered with an empty list and discovery is retried in the background.
+
+Run `/zenmux-refresh` to force an immediate update. The command reports success or failure, and a failed update leaves the current models and cache intact. Delete `zenmux-models.json` to reinitialize the cache from scratch.
 
 ## Optional endpoint override
 
